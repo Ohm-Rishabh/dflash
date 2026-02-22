@@ -256,7 +256,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
             posterior = sample(output.logits, temperature)
             # Absurd: only accept one token per iteration (acceptance_length=0 → accept 1 draft token)
-            acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+            acceptance_length = 0
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
             start += acceptance_length + 1
