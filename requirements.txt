@@ -3,3 +3,6 @@ accelerate
 rich
 packaging
 ninja
+# For correlation plot (modal_benchmark.py, local run)
+pandas
+matplotlib
