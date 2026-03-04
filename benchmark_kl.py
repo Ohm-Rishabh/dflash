@@ -45,21 +45,34 @@ def _kl_divergence_topk(draft_logits: "torch.Tensor", target_logits: "torch.Tens
     return kl_div
 
 
-def _block_size_from_kl_divergence(kl_div: float | None, batch_sizes: list[int]) -> int:
+def _block_size_from_kl_divergence(kl_pos_0_prev: float | None, kl_w10: float | None, batch_sizes: list[int]) -> int:
     """
-    Choose block size from windowed KL divergence (lower KL = better alignment).
-    Placeholder thresholds; will need to be calibrated from Phase 1 profiling data.
+    Choose block size using the previous step's kl_pos_0 (strongest signal, r=-0.385)
+    blended with trailing w=10 (r=-0.241) for smoothing.
+    
+    Thresholds calibrated from 30-sample AIME25 profiling run:
+    - ~80% of kl_pos_0 values are < 1.0 (these have acceptance_length ~8-16)
+    - Values 1-5 show moderate acceptance (~4-10)
+    - Values > 5 show low acceptance (~1-4)
     """
-    if kl_div is None:
-        return batch_sizes[-1]  # default max block size
-    # Placeholder: lower KL -> larger block
-    # These thresholds are completely untuned; they just provide the structure
-    if kl_div < 0.5:
+    if kl_pos_0_prev is None:
+        return batch_sizes[-1]  # default max block size on first step
+    
+    # Primary signal: kl_pos_0 from previous step
+    # Secondary signal: trailing w=10 mean (smoother, less noisy)
+    # Blend: 70% kl_pos_0, 30% kl_w10 (when available)
+    if kl_w10 is not None:
+        kl_signal = 0.7 * kl_pos_0_prev + 0.3 * kl_w10
+    else:
+        kl_signal = kl_pos_0_prev
+    
+    # Calibrated thresholds from profiling data
+    if kl_signal < 0.5:
         return 16 if 16 in batch_sizes else batch_sizes[-1]
-    if kl_div < 1.0:
-        return 12 if 12 in batch_sizes else 8
-    if kl_div < 2.0:
-        return 8
+    if kl_signal < 1.5:
+        return 12 if 12 in batch_sizes else batch_sizes[-1]
+    if kl_signal < 3.0:
+        return 8 if 8 in batch_sizes else batch_sizes[0]
     return 4 if 4 in batch_sizes else batch_sizes[0]
 
 @torch.inference_mode()
@@ -111,10 +124,10 @@ def dflash_generate(
     acceptance_lengths = []
     kl_divergence_log = []
     
-    # Configuration for adaptive / profiling
-    KL_WINDOW_W = 10
-    kl_divergence_list = []
+    # KL tracking state
+    kl_divergence_list = []   # Per-token KL values for trailing windows
     last_draft_logits = None
+    prev_kl_pos_0 = None      # kl_pos_0 from the previous step (primary adaptive signal)
     
     draft_prefill = True
 
@@ -122,19 +135,19 @@ def dflash_generate(
         step_start_kl_overall = None
         
         if block_size > 1:
-            # We'll calculate a few different metrics to find the best correlation
+            # Compute all window metrics for logging
             kl_w10, kl_w5, kl_w3, kl_w1 = None, None, None, None
             if kl_divergence_list:
                 kl_w10 = float(np.mean(kl_divergence_list[-10:])) if len(kl_divergence_list) >= 10 else float(np.mean(kl_divergence_list))
                 kl_w5 = float(np.mean(kl_divergence_list[-5:])) if len(kl_divergence_list) >= 5 else float(np.mean(kl_divergence_list))
                 kl_w3 = float(np.mean(kl_divergence_list[-3:])) if len(kl_divergence_list) >= 3 else float(np.mean(kl_divergence_list))
-                kl_w1 = float(kl_divergence_list[-1]) # Just the very last token's KL
+                kl_w1 = float(kl_divergence_list[-1])
             
-            # Use w5 as the main one for now
             step_start_kl_overall = kl_w5
 
             if mode == "adaptive-kl":
-                block_size = _block_size_from_kl_divergence(step_start_kl_overall, [4, 8, 12, 16])
+                # Use previous step's kl_pos_0 (strongest signal, r=-0.385) blended with w=10
+                block_size = _block_size_from_kl_divergence(prev_kl_pos_0, kl_w10, [4, 8, 12, 16])
             elif mode == "profiling":
                 block_size = 16
 
@@ -184,15 +197,19 @@ def dflash_generate(
             
             kl_divergence_log.append({
                 "block_size": block_size,
-                "kl_divergence": step_start_kl_overall,          # The w5 trailing mean used for decision
+                "kl_divergence": step_start_kl_overall,
                 "kl_w10": kl_w10,
                 "kl_w5": kl_w5,
                 "kl_w3": kl_w3,
                 "kl_w1": kl_w1,
-                "kl_pos_0": kl_pos_0,                            # The actual KL of the first token in THIS block
+                "kl_pos_0": kl_pos_0,
+                "prev_kl_pos_0": prev_kl_pos_0,                  # The signal used for adaptive decisions
                 "kl_divergence_per_pos": kl_div.cpu().tolist(),
                 "acceptance_length": acceptance_length + 1,
             })
+            
+            # Save kl_pos_0 for the NEXT step's adaptive decision
+            prev_kl_pos_0 = kl_pos_0
 
         start += acceptance_length + 1
         past_key_values_target.crop(start)
