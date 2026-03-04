@@ -45,6 +45,58 @@ def _kl_divergence_topk(draft_logits: "torch.Tensor", target_logits: "torch.Tens
     return kl_div
 
 
+def _clean_token_confidence(target_logits: "torch.Tensor", acceptance_length: int) -> dict:
+    """
+    Compute the target model's confidence at the bonus token position.
+    The bonus token = posterior[:, acceptance_length], which becomes the
+    clean token (position 0) for the NEXT block.
+    
+    Returns dict with:
+      - max_prob: max softmax probability (higher = more confident)
+      - entropy: Shannon entropy of the distribution (lower = more confident)
+      - neg_entropy: -entropy (higher = more confident, for easy correlation)
+    """
+    import torch
+    import torch.nn.functional as F
+    
+    # target_logits shape: (1, block_size+1, vocab)
+    # The bonus token logits are at position acceptance_length
+    logits_at_bonus = target_logits[0, acceptance_length]  # (vocab,)
+    probs = F.softmax(logits_at_bonus, dim=-1)
+    log_probs = F.log_softmax(logits_at_bonus, dim=-1)
+    
+    max_prob = probs.max().item()
+    entropy = -(probs * log_probs).sum().item()
+    
+    return {
+        "max_prob": max_prob,
+        "entropy": entropy,
+        "neg_entropy": -entropy,
+    }
+
+
+def _block_size_from_clean_confidence(max_prob: float | None, batch_sizes: list[int]) -> int:
+    """
+    Choose block size from the clean token's max probability.
+    Higher max_prob = target is confident about the bonus token
+    = the clean token for the next block is a strong anchor
+    = draft model will produce better tokens
+    = use a larger block size.
+    
+    Thresholds need calibration from profiling data.
+    """
+    if max_prob is None:
+        return batch_sizes[-1]  # default max
+    # Higher confidence -> larger block
+    if max_prob > 0.9:
+        return 16 if 16 in batch_sizes else batch_sizes[-1]
+    if max_prob > 0.5:
+        return 12 if 12 in batch_sizes else batch_sizes[-1]
+    if max_prob > 0.2:
+        return 8 if 8 in batch_sizes else batch_sizes[0]
+    return 4 if 4 in batch_sizes else batch_sizes[0]
+
+
 def _block_size_from_kl_divergence(kl_pos_0_prev: float | None, kl_w10: float | None, batch_sizes: list[int]) -> int:
     """
     Choose block size using the previous step's kl_pos_0 (strongest signal, r=-0.385)
@@ -85,7 +137,7 @@ def dflash_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
-    mode: str = "profiling",
+    mode: str = "profiling",  # "profiling", "adaptive-kl", "adaptive-confidence"
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -127,7 +179,10 @@ def dflash_generate(
     # KL tracking state
     kl_divergence_list = []   # Per-token KL values for trailing windows
     last_draft_logits = None
-    prev_kl_pos_0 = None      # kl_pos_0 from the previous step (primary adaptive signal)
+    prev_kl_pos_0 = None      # kl_pos_0 from the previous step
+    
+    # Clean token confidence tracking
+    prev_clean_conf = None    # max_prob of the bonus token from previous step
     
     draft_prefill = True
 
@@ -146,8 +201,9 @@ def dflash_generate(
             step_start_kl_overall = kl_w5
 
             if mode == "adaptive-kl":
-                # Use previous step's kl_pos_0 (strongest signal, r=-0.385) blended with w=10
                 block_size = _block_size_from_kl_divergence(prev_kl_pos_0, kl_w10, [4, 8, 12, 16])
+            elif mode == "adaptive-confidence":
+                block_size = _block_size_from_clean_confidence(prev_clean_conf, [4, 8, 12, 16])
             elif mode == "profiling":
                 block_size = 16
 
@@ -190,10 +246,11 @@ def dflash_generate(
             kl_div = _kl_divergence_topk(last_draft_logits, output.logits[:, :-1, :])  # (bs-1,)
             accepted_kl = kl_div[:max(1, acceptance_length)].cpu().tolist()
             kl_divergence_list.extend(accepted_kl)
-            
-            # The KL of the *first* drafted token in this block (position 0)
-            # This is the most direct signal for the *current* step, rather than trailing window
             kl_pos_0 = kl_div[0].item() if len(kl_div) > 0 else None
+            
+            # Clean token confidence: confidence of the BONUS token
+            # This bonus token becomes position 0 (clean token) of the NEXT block
+            clean_conf = _clean_token_confidence(output.logits, acceptance_length)
             
             kl_divergence_log.append({
                 "block_size": block_size,
@@ -203,13 +260,17 @@ def dflash_generate(
                 "kl_w3": kl_w3,
                 "kl_w1": kl_w1,
                 "kl_pos_0": kl_pos_0,
-                "prev_kl_pos_0": prev_kl_pos_0,                  # The signal used for adaptive decisions
-                "kl_divergence_per_pos": kl_div.cpu().tolist(),
+                "prev_kl_pos_0": prev_kl_pos_0,
+                # Clean token confidence metrics
+                "clean_max_prob": clean_conf["max_prob"],
+                "clean_entropy": clean_conf["entropy"],
+                "clean_neg_entropy": clean_conf["neg_entropy"],
+                "prev_clean_max_prob": prev_clean_conf,
                 "acceptance_length": acceptance_length + 1,
             })
             
-            # Save kl_pos_0 for the NEXT step's adaptive decision
             prev_kl_pos_0 = kl_pos_0
+            prev_clean_conf = clean_conf["max_prob"]
 
         start += acceptance_length + 1
         past_key_values_target.crop(start)
@@ -321,35 +382,44 @@ def _plot_kl_correlation_matrix(
                 "kl_w3": float(entry["kl_w3"]) if entry.get("kl_w3") is not None else None,
                 "kl_w1": float(entry["kl_w1"]) if entry.get("kl_w1") is not None else None,
                 "kl_pos_0": float(entry["kl_pos_0"]) if entry.get("kl_pos_0") is not None else None,
+                "clean_max_prob": float(entry["clean_max_prob"]) if entry.get("clean_max_prob") is not None else None,
+                "clean_entropy": float(entry["clean_entropy"]) if entry.get("clean_entropy") is not None else None,
+                "prev_clean_max_prob": float(entry["prev_clean_max_prob"]) if entry.get("prev_clean_max_prob") is not None else None,
                 "acceptance_length": entry["acceptance_length"],
             })
 
     if not all_rows:
-        print("No KL divergence data available for plotting.")
+        print("No profiling data available for plotting.")
         return
 
     df = pd.DataFrame(all_rows)
     y = df["acceptance_length"].values
     
+    # All metrics to plot: KL metrics + clean token confidence metrics
     metrics_to_plot = {
-        "kl_w10": "Trailing Window (w=10)",
-        "kl_w5": "Trailing Window (w=5)",
-        "kl_w3": "Trailing Window (w=3)",
-        "kl_w1": "Previous Token Only (w=1)",
-        "kl_pos_0": "Current Block Token 0",
+        # KL divergence metrics
+        "kl_w10": ("Trailing Window (w=10)", "KL Divergence"),
+        "kl_w5": ("Trailing Window (w=5)", "KL Divergence"),
+        "kl_w3": ("Trailing Window (w=3)", "KL Divergence"),
+        "kl_w1": ("Previous Token Only (w=1)", "KL Divergence"),
+        "kl_pos_0": ("Current Block Token 0", "KL Divergence"),
+        # Clean token confidence metrics
+        "clean_max_prob": ("Bonus Token Max Prob (current step)", "Max Probability"),
+        "clean_entropy": ("Bonus Token Entropy (current step)", "Entropy"),
+        "prev_clean_max_prob": ("Prev Bonus Token Max Prob (predictive)", "Max Probability"),
     }
     
-    for metric, name in metrics_to_plot.items():
-        if df[metric].notna().any():
+    for metric, (name, xlabel) in metrics_to_plot.items():
+        if metric in df.columns and df[metric].notna().any():
             valid_idx = df[metric].notna()
             x_valid = df[metric][valid_idx].values
             y_valid = y[valid_idx]
             
             out_path = base_out_path.with_name(f"{base_out_path.stem}_{metric}{base_out_path.suffix}")
             _plot_one_kl_acceptance(
-                x_valid, y_valid, out_path, f"KL Divergence [{name}] vs acceptance length (block_size={block_size})", use_hexbin=True
+                x_valid, y_valid, out_path, f"{name} vs acceptance length (block_size={block_size})", use_hexbin=True
             )
-            print(f"[{metric}] KL correlation plot saved to {out_path}")
+            print(f"[{metric}] correlation plot saved to {out_path}")
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -360,7 +430,7 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--mode", type=str, default="profiling", choices=["profiling", "adaptive-kl"], help="Run in standard profiling mode (fixed bs) or adaptive block size based on KL")
+    parser.add_argument("--mode", type=str, default="profiling", choices=["profiling", "adaptive-kl", "adaptive-confidence"], help="Run mode: profiling (fixed bs=16), adaptive-kl, or adaptive-confidence (clean token)")
     parser.add_argument("--save-results", action="store_true", help="Save the execution results to a JSON file and plot correlation matrices")
     args = parser.parse_args()
 
