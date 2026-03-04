@@ -122,10 +122,16 @@ def dflash_generate(
         step_start_kl_overall = None
         
         if block_size > 1:
-            if len(kl_divergence_list) >= KL_WINDOW_W:
-                step_start_kl_overall = float(np.mean(kl_divergence_list[-KL_WINDOW_W:]))
-            elif kl_divergence_list:
-                step_start_kl_overall = float(np.mean(kl_divergence_list))
+            # We'll calculate a few different metrics to find the best correlation
+            kl_w10, kl_w5, kl_w3, kl_w1 = None, None, None, None
+            if kl_divergence_list:
+                kl_w10 = float(np.mean(kl_divergence_list[-10:])) if len(kl_divergence_list) >= 10 else float(np.mean(kl_divergence_list))
+                kl_w5 = float(np.mean(kl_divergence_list[-5:])) if len(kl_divergence_list) >= 5 else float(np.mean(kl_divergence_list))
+                kl_w3 = float(np.mean(kl_divergence_list[-3:])) if len(kl_divergence_list) >= 3 else float(np.mean(kl_divergence_list))
+                kl_w1 = float(kl_divergence_list[-1]) # Just the very last token's KL
+            
+            # Use w5 as the main one for now
+            step_start_kl_overall = kl_w5
 
             if mode == "adaptive-kl":
                 block_size = _block_size_from_kl_divergence(step_start_kl_overall, [4, 8, 12, 16])
@@ -172,9 +178,18 @@ def dflash_generate(
             accepted_kl = kl_div[:max(1, acceptance_length)].cpu().tolist()
             kl_divergence_list.extend(accepted_kl)
             
+            # The KL of the *first* drafted token in this block (position 0)
+            # This is the most direct signal for the *current* step, rather than trailing window
+            kl_pos_0 = kl_div[0].item() if len(kl_div) > 0 else None
+            
             kl_divergence_log.append({
                 "block_size": block_size,
-                "kl_divergence": step_start_kl_overall,
+                "kl_divergence": step_start_kl_overall,          # The w5 trailing mean used for decision
+                "kl_w10": kl_w10,
+                "kl_w5": kl_w5,
+                "kl_w3": kl_w3,
+                "kl_w1": kl_w1,
+                "kl_pos_0": kl_pos_0,                            # The actual KL of the first token in THIS block
                 "kl_divergence_per_pos": kl_div.cpu().tolist(),
                 "acceptance_length": acceptance_length + 1,
             })
@@ -265,7 +280,7 @@ def _plot_one_kl_acceptance(
 
 
 def _plot_kl_correlation_matrix(
-    responses: list, out_path: Path, block_size: int
+    responses: list, base_out_path: Path, block_size: int
 ) -> None:
     try:
         import pandas as pd
@@ -283,24 +298,41 @@ def _plot_kl_correlation_matrix(
             continue
             
         for entry in spec_resp.kl_divergence_log:
-            if entry.get("kl_divergence") is not None:
-                all_rows.append({
-                    "kl_divergence": float(entry["kl_divergence"]),
-                    "acceptance_length": entry["acceptance_length"],
-                })
+            all_rows.append({
+                "kl_w10": float(entry["kl_w10"]) if entry.get("kl_w10") is not None else None,
+                "kl_w5": float(entry["kl_w5"]) if entry.get("kl_w5") is not None else None,
+                "kl_w3": float(entry["kl_w3"]) if entry.get("kl_w3") is not None else None,
+                "kl_w1": float(entry["kl_w1"]) if entry.get("kl_w1") is not None else None,
+                "kl_pos_0": float(entry["kl_pos_0"]) if entry.get("kl_pos_0") is not None else None,
+                "acceptance_length": entry["acceptance_length"],
+            })
 
     if not all_rows:
         print("No KL divergence data available for plotting.")
         return
 
     df = pd.DataFrame(all_rows)
-    x = df["kl_divergence"].values
     y = df["acceptance_length"].values
     
-    _plot_one_kl_acceptance(
-        x, y, out_path, f"KL Divergence vs acceptance length (block_size={block_size})", use_hexbin=True
-    )
-    print(f"KL correlation plot saved to {out_path}")
+    metrics_to_plot = {
+        "kl_w10": "Trailing Window (w=10)",
+        "kl_w5": "Trailing Window (w=5)",
+        "kl_w3": "Trailing Window (w=3)",
+        "kl_w1": "Previous Token Only (w=1)",
+        "kl_pos_0": "Current Block Token 0",
+    }
+    
+    for metric, name in metrics_to_plot.items():
+        if df[metric].notna().any():
+            valid_idx = df[metric].notna()
+            x_valid = df[metric][valid_idx].values
+            y_valid = y[valid_idx]
+            
+            out_path = base_out_path.with_name(f"{base_out_path.stem}_{metric}{base_out_path.suffix}")
+            _plot_one_kl_acceptance(
+                x_valid, y_valid, out_path, f"KL Divergence [{name}] vs acceptance length (block_size={block_size})", use_hexbin=True
+            )
+            print(f"[{metric}] KL correlation plot saved to {out_path}")
 
 def main() -> None:
     parser = argparse.ArgumentParser()
